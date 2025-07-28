@@ -1,296 +1,383 @@
 import os
 import torch
-import torch.nn as nn
-from PIL import Image
-import numpy as np
+from PIL import Image, ImageEnhance, ImageFilter
 from transformers import (
     BlipProcessor, BlipForConditionalGeneration,
-    pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
+    AutoTokenizer, AutoModelForSeq2SeqLM,
+    VisionEncoderDecoderModel, ViTImageProcessor, AutoTokenizer as AutoTokenizer2
 )
-import cv2
 from gtts import gTTS
 import pygame
-import io
+import platform
 import tempfile
+import time
 import warnings
+import uuid
+import numpy as np
+import cv2
+import base64
+import io
+
 warnings.filterwarnings('ignore')
 
 class MultilingualImageToSpeech:
-    def __init__(self):
-        """Initialize the multilingual image-to-speech model"""
-        print("Initializing Multilingual Image-to-Speech Model...")
-        
-        # Initialize image captioning model (BLIP)
-        self.caption_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-        self.caption_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
-        
-        # Initialize translation models
-        self.init_translation_models()
-        
-        # Initialize pygame for audio playback
+    def __init__(self, audio_output_dir="outputs/audio_clips"):
+        print("Initializing Enhanced Multilingual Image-to-Speech Model...")
+        os.makedirs(audio_output_dir, exist_ok=True)
+        self.audio_output_dir = audio_output_dir
+
         pygame.mixer.init()
+
+        # Load multiple captioning models for better accuracy
+        print("Loading BLIP model...")
+        self.caption_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
+        self.caption_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large")
         
-        # Language codes for gTTS
+        # Load additional captioning model for cross-validation
+        try:
+            print("Loading ViT-GPT2 model...")
+            self.vit_processor = ViTImageProcessor.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
+            self.vit_model = VisionEncoderDecoderModel.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
+            self.vit_tokenizer = AutoTokenizer2.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
+            self.use_vit = True
+        except Exception as e:
+            print(f"ViT-GPT2 model not available: {e}")
+            self.use_vit = False
+
+        # Updated language codes - removed Assamese, improved voice support
         self.lang_codes = {
-            'english': 'en',
-            'hindi': 'hi',
-            'bengali': 'bn'
+            'english': 'en', 
+            'hindi': 'hi', 
+            'bengali': 'bn',
+            'telugu': 'te', 
+            'tamil': 'ta', 
+            'malayalam': 'ml'
         }
         
+        # Updated TTS supported languages with better compatibility
+        self.tts_supported = {'en', 'hi', 'bn', 'ta', 'te', 'ml'}
+        self.supported_languages = list(self.lang_codes.keys())
+
+        self.translation_models = {}
+        self.translation_tokenizers = {}
+
+        self.init_translation_models()
+        self.load_nllb_models()
+
         print("Model initialization complete!")
-    
+
     def init_translation_models(self):
-        """Initialize translation models for Hindi and Bengali"""
+        model_mappings = {
+            'hindi': "Helsinki-NLP/opus-mt-en-hi",
+            'malayalam': "Helsinki-NLP/opus-mt-en-ml"
+        }
+        for lang, model_name in model_mappings.items():
+            self.load_model(lang, model_name)
+
+    def load_model(self, lang, model_name):
         try:
-            # For Hindi translation
-            self.hindi_tokenizer = AutoTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-hi")
-            self.hindi_model = AutoModelForSeq2SeqLM.from_pretrained("Helsinki-NLP/opus-mt-en-hi")
-            
-            # For Bengali translation
-            self.bengali_tokenizer = AutoTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-bn")
-            self.bengali_model = AutoModelForSeq2SeqLM.from_pretrained("Helsinki-NLP/opus-mt-en-bn")
-            
-            print("Translation models loaded successfully!")
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+            self.translation_tokenizers[lang] = tokenizer
+            self.translation_models[lang] = model
+            print(f"✅ Loaded {lang} translation model")
         except Exception as e:
-            print(f"Warning: Could not load translation models: {e}")
-            self.hindi_tokenizer = self.hindi_model = None
-            self.bengali_tokenizer = self.bengali_model = None
-    
-    def preprocess_image(self, image_path):
-        """Preprocess image for the model"""
+            print(f"⚠ Could not load {lang} model: {e}")
+            self.translation_tokenizers[lang] = None
+            self.translation_models[lang] = None
+
+    def load_nllb_models(self):
         try:
-            # Load image
-            if isinstance(image_path, str):
-                image = Image.open(image_path).convert('RGB')
-            else:
-                image = image_path.convert('RGB')
+            self.nllb_tokenizer = AutoTokenizer.from_pretrained(
+                "facebook/nllb-200-distilled-600M", use_fast=False
+            )
+            self.nllb_model = AutoModelForSeq2SeqLM.from_pretrained("facebook/nllb-200-distilled-600M")
+            self.nllb_lang_codes = {
+                'bengali': 'ben_Beng',
+                'telugu': 'tel_Telu', 
+                'tamil': 'tam_Taml'
+            }
+            print("✅ Loaded NLLB translation model")
+        except Exception as e:
+            print(f"⚠ Could not load NLLB model: {e}")
+
+    def enhance_image_quality(self, image):
+        """Enhance image quality for better captioning"""
+        try:
+            # Convert PIL to OpenCV format
+            opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
             
-            # Resize image if too large
-            max_size = 512
+            # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+            lab = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            l = clahe.apply(l)
+            enhanced = cv2.merge([l, a, b])
+            enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+            
+            # Convert back to PIL
+            enhanced_pil = Image.fromarray(cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB))
+            
+            # Additional PIL enhancements
+            enhancer = ImageEnhance.Contrast(enhanced_pil)
+            enhanced_pil = enhancer.enhance(1.2)
+            
+            enhancer = ImageEnhance.Sharpness(enhanced_pil)
+            enhanced_pil = enhancer.enhance(1.1)
+            
+            return enhanced_pil
+        except Exception as e:
+            print(f"Image enhancement failed: {e}")
+            return image
+
+    def generate_caption_blip(self, image):
+        """Generate caption using BLIP model"""
+        try:
+            # Try multiple prompts for better context
+            prompts = [
+                "a photo of",
+                "this image shows",
+                "in this picture there is"
+            ]
+            
+            captions = []
+            for prompt in prompts:
+                inputs = self.caption_processor(image, text=prompt, return_tensors="pt")
+                with torch.no_grad():
+                    out = self.caption_model.generate(
+                        **inputs, 
+                        max_length=100, 
+                        num_beams=5,
+                        temperature=0.7,
+                        do_sample=True
+                    )
+                caption = self.caption_processor.decode(out[0], skip_special_tokens=True)
+                captions.append(caption)
+            
+            # Return the most detailed caption
+            return max(captions, key=len)
+        except Exception as e:
+            print(f"BLIP captioning failed: {e}")
+            return None
+
+    def generate_caption_vit(self, image):
+        """Generate caption using ViT-GPT2 model"""
+        if not self.use_vit:
+            return None
+            
+        try:
+            pixel_values = self.vit_processor(image, return_tensors="pt").pixel_values
+            
+            with torch.no_grad():
+                output_ids = self.vit_model.generate(
+                    pixel_values, 
+                    max_length=50, 
+                    num_beams=4,
+                    temperature=0.8,
+                    do_sample=True
+                )
+            
+            caption = self.vit_tokenizer.decode(output_ids[0], skip_special_tokens=True)
+            return caption
+        except Exception as e:
+            print(f"ViT captioning failed: {e}")
+            return None
+
+    def generate_caption(self, image):
+        """Generate caption using multiple models and select the best one"""
+        try:
+            # Enhance image quality first
+            enhanced_image = self.enhance_image_quality(image)
+            
+            # Get captions from both models
+            blip_caption = self.generate_caption_blip(enhanced_image)
+            vit_caption = self.generate_caption_vit(enhanced_image)
+            
+            print(f"BLIP Caption: {blip_caption}")
+            if vit_caption:
+                print(f"ViT Caption: {vit_caption}")
+            
+            # Select the best caption (longer and more descriptive)
+            captions = [cap for cap in [blip_caption, vit_caption] if cap and len(cap.strip()) > 5]
+            
+            if not captions:
+                return "Unable to describe the image clearly."
+            
+            # Return the most descriptive caption
+            best_caption = max(captions, key=lambda x: len(x.split()))
+            
+            # Clean up the caption
+            if best_caption.lower().startswith(('a photo of', 'this image shows', 'in this picture there is')):
+                words = best_caption.split()
+                if len(words) > 3:
+                    best_caption = ' '.join(words[3:])
+            
+            return best_caption.strip()
+            
+        except Exception as e:
+            print(f"Error generating caption: {e}")
+            return "Unable to describe the image."
+
+    def translate_text(self, text, target_language):
+        try:
+            lang_key = target_language.lower()
+
+            if (lang_key in self.translation_models and 
+                self.translation_models[lang_key] is not None and
+                self.translation_tokenizers[lang_key] is not None):
+
+                tokenizer = self.translation_tokenizers[lang_key]
+                model = self.translation_models[lang_key]
+                inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+                with torch.no_grad():
+                    outputs = model.generate(**inputs, max_length=128, num_beams=4)
+                translated = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                print(f"✅ Translated to {target_language}: {translated}")
+                return translated
+
+            elif lang_key in self.nllb_lang_codes:
+                tgt_lang = self.nllb_lang_codes[lang_key]
+                tokenizer = self.nllb_tokenizer
+                model = self.nllb_model
+
+                tokenizer.src_lang = "eng_Latn"
+                encoded = tokenizer(text, return_tensors="pt")
+                generated = model.generate(**encoded, forced_bos_token_id=tokenizer.convert_tokens_to_ids(tgt_lang))
+                translated = tokenizer.batch_decode(generated, skip_special_tokens=True)[0]
+                print(f"✅ Translated to {target_language}: {translated}")
+                return translated
+
+            else:
+                print(f"⚠ No translation model for {target_language}. Returning English.")
+                return text
+
+        except Exception as e:
+            print(f"❌ Translation failed for {target_language}: {e}")
+            return text
+
+    def generate_tts_audio_base64(self, text, language_code):
+        """Generate TTS audio and return as base64 string"""
+        try:
+            if language_code not in self.tts_supported:
+                print(f"❌ TTS generation failed: Language not supported by gTTS: {language_code}")
+                return None
+                
+            # Create TTS object
+            tts = gTTS(text=text, lang=language_code, slow=False)
+            
+            # Save to a BytesIO buffer instead of file
+            audio_buffer = io.BytesIO()
+            tts.write_to_fp(audio_buffer)
+            audio_buffer.seek(0)
+            
+            # Convert to base64
+            audio_base64 = base64.b64encode(audio_buffer.read()).decode('utf-8')
+            
+            print(f"✅ Generated TTS audio for {language_code}, length: {len(audio_base64)} chars")
+            return audio_base64
+            
+        except Exception as e:
+            print(f"❌ TTS generation failed for {language_code}: {e}")
+            return None
+
+    def generate_tts_audio(self, text, language_code, filename):
+        """Generate TTS audio file (legacy method for local testing)"""
+        try:
+            if language_code not in self.tts_supported:
+                print(f"❌ TTS generation failed: Language not supported by gTTS: {language_code}")
+                return None
+            tts = gTTS(text=text, lang=language_code, slow=False)
+            audio_path = os.path.join(self.audio_output_dir, filename)
+            tts.save(audio_path)
+            return audio_path
+        except Exception as e:
+            print(f"❌ TTS generation failed: {e}")
+            return None
+
+    def play_audio(self, audio_path):
+        try:
+            pygame.mixer.music.load(audio_path)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                pygame.time.wait(100)
+            return True
+        except Exception as e:
+            print(f"❌ Audio playback failed: {e}")
+            return False
+
+    def text_to_speech(self, text, language='english', save_audio=True, play_audio=True):
+        lang_code = self.lang_codes.get(language.lower(), 'en')
+        filename = f"{language.lower()}_{uuid.uuid4().hex[:8]}.mp3"
+        audio_path = self.generate_tts_audio(text, lang_code, filename)
+        if audio_path and play_audio:
+            self.play_audio(audio_path)
+        return audio_path
+
+    def preprocess_image(self, image_path):
+        try:
+            image = Image.open(image_path).convert('RGB')
+            
+            # Don't resize too small - keep more detail
+            max_size = 768
             if max(image.size) > max_size:
                 image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
             
             return image
         except Exception as e:
-            print(f"Error preprocessing image: {e}")
+            print(f"Error loading image: {e}")
             return None
-    
-    def generate_caption(self, image):
-        """Generate English caption for the image"""
-        try:
-            # Process image
-            inputs = self.caption_processor(image, return_tensors="pt")
-            
-            # Generate caption
-            with torch.no_grad():
-                out = self.caption_model.generate(**inputs, max_length=50, num_beams=4)
-            
-            # Decode caption
-            caption = self.caption_processor.decode(out[0], skip_special_tokens=True)
-            
-            return caption
-        except Exception as e:
-            print(f"Error generating caption: {e}")
-            return "Unable to describe the image."
-    
-    def translate_text(self, text, target_language):
-        """Translate text to target language"""
-        try:
-            if target_language.lower() == 'english':
-                return text
-            
-            elif target_language.lower() == 'hindi' and self.hindi_model:
-                inputs = self.hindi_tokenizer(text, return_tensors="pt", padding=True, truncation=True)
-                with torch.no_grad():
-                    outputs = self.hindi_model.generate(**inputs, max_length=128, num_beams=4)
-                translated = self.hindi_tokenizer.decode(outputs[0], skip_special_tokens=True)
-                return translated
-            
-            elif target_language.lower() == 'bengali' and self.bengali_model:
-                inputs = self.bengali_tokenizer(text, return_tensors="pt", padding=True, truncation=True)
-                with torch.no_grad():
-                    outputs = self.bengali_model.generate(**inputs, max_length=128, num_beams=4)
-                translated = self.bengali_tokenizer.decode(outputs[0], skip_special_tokens=True)
-                return translated
-            
-            else:
-                print(f"Translation not available for {target_language}")
-                return text
-                
-        except Exception as e:
-            print(f"Error translating to {target_language}: {e}")
-            return text
-    
-    def text_to_speech(self, text, language='english', save_path=None):
-        """Convert text to speech"""
-        try:
-            lang_code = self.lang_codes.get(language.lower(), 'en')
-            
-            # Create TTS object
-            tts = gTTS(text=text, lang=lang_code, slow=False)
-            
-            if save_path:
-                tts.save(save_path)
-                print(f"Audio saved to {save_path}")
-            else:
-                # Save to temporary file and play
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as tmp_file:
-                    tts.save(tmp_file.name)
-                    self.play_audio(tmp_file.name)
-                    os.unlink(tmp_file.name)  # Delete temporary file
-                    
-        except Exception as e:
-            print(f"Error in text-to-speech conversion: {e}")
-    
-    def play_audio(self, audio_path):
-        """Play audio file"""
-        try:
-            pygame.mixer.music.load(audio_path)
-            pygame.mixer.music.play()
-            
-            # Wait for playback to finish
-            while pygame.mixer.music.get_busy():
-                pygame.time.wait(100)
-                
-        except Exception as e:
-            print(f"Error playing audio: {e}")
-    
-    def process_image_to_speech(self, image_path, save_audio=True):
-        """Complete pipeline: image -> text -> speech (always in all three languages)"""
+
+    def process_image_to_speech(self, image_path, languages=None, save_audio=True, play_audio=True, return_base64_audio=True):
         results = {}
-        languages = ['english', 'hindi', 'bengali']  # Always process all three languages
-        
-        print(f"Processing image: {image_path}")
-        print("Generating descriptions in English, Hindi, and Bengali...")
-        
-        # Preprocess image
+        if languages is None:
+            languages = self.supported_languages
+
         image = self.preprocess_image(image_path)
         if image is None:
             return results
-        
-        # Generate English caption
-        english_caption = self.generate_caption(image)
-        print(f"English Description: {english_caption}")
-        
-        # Process for each language
-        for language in languages:
-            print(f"\nProcessing for {language}...")
-            
-            if language.lower() == 'english':
-                description = english_caption
-            else:
-                description = self.translate_text(english_caption, language)
-            
-            print(f"{language.title()} Description: {description}")
-            
-            # Convert to speech (always save audio)
-            audio_path = f"description_{language.lower()}.mp3"
-            self.text_to_speech(description, language, audio_path)
-            
-            results[language] = description
-        
-        return results
-    
-    def batch_process(self, image_folder):
-        """Process multiple images in a folder (always in all three languages)"""
-        supported_formats = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff')
-        
-        for filename in os.listdir(image_folder):
-            if filename.lower().endswith(supported_formats):
-                image_path = os.path.join(image_folder, filename)
-                print(f"\n{'='*50}")
-                print(f"Processing: {filename}")
-                print('='*50)
-                
-                results = self.process_image_to_speech(image_path)
-                
-                # Save results to text file
-                result_file = f"results_{filename.split('.')[0]}.txt"
-                with open(result_file, 'w', encoding='utf-8') as f:
-                    for lang, desc in results.items():
-                        f.write(f"{lang.title()}: {desc}\n")
-                
-                print(f"Results saved to {result_file}")
 
-def main():
-    """Main function to demonstrate the model"""
-    # Initialize the model
-    model = MultilingualImageToSpeech()
-    
-    # Example usage
-    print("\n" + "="*60)
-    print("MULTILINGUAL IMAGE-TO-SPEECH MODEL")
-    print("="*60)
-    
-    # Example 1: Process single image
-    print("\nExample 1: Single Image Processing")
-    print("-" * 40)
-    
-    # You can replace this with your image path
-    image_path = "sample_image.jpg"  # Replace with actual image path
-    
-    # Check if image exists
-    if os.path.exists(image_path):
-        results = model.process_image_to_speech(image_path)
+        print(f"\n🖼️ Processing image: {image_path}")
+        print(f"📏 Image size: {image.size}")
         
-        print("\nResults:")
-        for lang, description in results.items():
-            print(f"{lang.title()}: {description}")
-    else:
-        print(f"Image not found: {image_path}")
-        print("Please provide a valid image path.")
-    
-    # Example 2: Interactive mode
-    print("\n" + "="*60)
-    print("INTERACTIVE MODE")
-    print("="*60)
-    
-    while True:
-        print("\nOptions:")
-        print("1. Process an image")
-        print("2. Process folder of images")
-        print("3. Exit")
-        
-        choice = input("\nEnter your choice (1-3): ").strip()
-        
-        if choice == '1':
-            img_path = input("Enter image path: ").strip()
-            if os.path.exists(img_path):
-                print("Processing image in English, Hindi, and Bengali...")
+        english_caption = self.generate_caption(image)
+        print(f"\n📝 Final English Caption: {english_caption}")
+
+        for lang in languages:
+            print(f"\n🔄 Processing {lang}...")
+            translation = self.translate_text(english_caption, lang)
+            print(f"🌍 {lang.title()} Translation: {translation}")
+            
+            # Generate audio
+            lang_code = self.lang_codes.get(lang.lower(), 'en')
+            audio_path = None
+            audio_base64 = None
+            
+            if return_base64_audio:
+                # Generate base64 audio for API response
+                audio_base64 = self.generate_tts_audio_base64(translation, lang_code)
+            
+            if save_audio or play_audio:
+                # Generate file for local playback
+                filename = f"{lang.lower()}_{uuid.uuid4().hex[:8]}.mp3"
+                audio_path = self.generate_tts_audio(translation, lang_code, filename)
                 
-                results = model.process_image_to_speech(img_path)
-                
-                print("\nResults:")
-                for lang, description in results.items():
-                    print(f"{lang.title()}: {description}")
-                    
-                print("\nAudio files saved:")
-                print("- description_english.mp3")
-                print("- description_hindi.mp3") 
-                print("- description_bengali.mp3")
-            else:
-                print("Image not found!")
-        
-        elif choice == '2':
-            folder_path = input("Enter folder path: ").strip()
-            if os.path.exists(folder_path):
-                print("Processing all images in English, Hindi, and Bengali...")
-                model.batch_process(folder_path)
-            else:
-                print("Folder not found!")
-        
-        elif choice == '3':
-            print("Goodbye!")
-            break
-        
-        else:
-            print("Invalid choice! Please try again.")
+                if audio_path and play_audio:
+                    self.play_audio(audio_path)
+            
+            results[lang] = {
+                'text': translation, 
+                'audio_path': audio_path,
+                'audio_base64': audio_base64
+            }
+
+        return results
+
 
 if __name__ == "__main__":
-    # Install required packages
-    print("Required packages:")
-    print("pip install torch torchvision transformers pillow opencv-python gtts pygame numpy")
-    print("\nMake sure you have an internet connection for the first run to download models.")
-    print("\n" + "="*60)
-    
-    main()
+    print("Enhanced Multilingual Image-to-Speech Model Ready")
+    model = MultilingualImageToSpeech()
+    image_path = input("Enter image path: ").strip()
+    if os.path.exists(image_path):
+        model.process_image_to_speech(image_path, play_audio=True, return_base64_audio=False)
+    else:
+        print("Image file not found!")
